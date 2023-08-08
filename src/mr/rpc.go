@@ -25,13 +25,16 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 type Args struct {
-	TaskId int
+	TaskId   int
+	TaskType int
 }
 
 type Reply struct {
-	id       int
-	TaskType int // 0 mapTask 1 reduceTask 2 wait 3 completed
+	Id       int
+	TaskType int // 0 map task 1 reduce task 2 wait 3 finished
 	Filename string
+	NMap     int
+	NReduce  int
 }
 
 // Cook up a unique-ish UNIX-domain socket name
