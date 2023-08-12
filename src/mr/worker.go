@@ -43,13 +43,13 @@ func Worker(mapf func(string, string) []KeyValue,
 	for {
 		reply := CallTask(Args{taskId, taskType})
 		switch reply.TaskType {
-		case 0:
+		case MapTask:
 			doMapTask(mapf, reply)
-		case 1:
+		case ReduceTask:
 			doReduceTask(reducef, reply)
-		case 2:
+		case Wait:
 			time.Sleep(1 * time.Second)
-		case 3:
+		case Finished:
 			return
 		default:
 			log.Fatalf("reply error")
@@ -62,7 +62,6 @@ func Worker(mapf func(string, string) []KeyValue,
 }
 
 func doMapTask(mapf func(string, string) []KeyValue, reply Reply) {
-	//fmt.Println(reply)
 	intermediate := []KeyValue{}
 
 	file, err := os.Open(reply.Filename)

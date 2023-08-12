@@ -31,7 +31,7 @@ type Args struct {
 
 type Reply struct {
 	Id       int
-	TaskType int // 0 map task 1 reduce task 2 wait 3 finished
+	TaskType int
 	Filename string
 	NMap     int
 	NReduce  int

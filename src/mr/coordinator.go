@@ -23,16 +23,23 @@ type Coordinator struct {
 	tasks           []Task
 	nMap            int
 	nReduce         int
-	currentTaskType int // 0 map task 1 reduce task 3 finished
+	currentTaskType int
 	mu              sync.Mutex
 }
+
+const (
+	MapTask int = iota
+	ReduceTask
+	Wait
+	Finished
+)
 
 // Your code here -- RPC handlers for the worker to call.
 func (c *Coordinator) AskTask(args *Args, reply *Reply) error {
 	c.mu.Lock()
 
 	//delete finished task
-	if args.TaskId != -1 && args.TaskType == c.currentTaskType {
+	if args.TaskType == c.currentTaskType {
 		for i := 0; i < len(c.tasks); i++ {
 			if args.TaskId == c.tasks[i].id {
 				c.tasks = append(c.tasks[:i], c.tasks[i+1:]...)
@@ -41,26 +48,26 @@ func (c *Coordinator) AskTask(args *Args, reply *Reply) error {
 		}
 	}
 
-	if c.currentTaskType == 0 && c.index == c.nMap && len(c.tasks) == 0 {
-		c.currentTaskType = 1
-		c.index = 0
+	if c.currentTaskType == MapTask && c.index == c.nMap && len(c.tasks) == 0 {
+		c.currentTaskType = ReduceTask
+		c.index = MapTask
 	}
 
-	if c.currentTaskType == 1 && c.index == c.nReduce && len(c.tasks) == 0 {
-		c.currentTaskType = 3
+	if c.currentTaskType == ReduceTask && c.index == c.nReduce && len(c.tasks) == 0 {
+		c.currentTaskType = Finished
 	}
 
-	if c.currentTaskType == 3 {
-		reply.TaskType = 3
+	if c.currentTaskType == Finished {
+		reply.TaskType = Finished
 		c.mu.Unlock()
 		return nil
 	}
 
 	//allocate task
-	taskType, nTask := 1, c.nReduce
+	taskType, nTask := ReduceTask, c.nReduce
 	filename := ""
-	if c.currentTaskType == 0 {
-		taskType = 0
+	if c.currentTaskType == MapTask {
+		taskType = MapTask
 		nTask = c.nMap
 		if c.index < c.nMap {
 			filename = c.files[c.index]
@@ -69,12 +76,12 @@ func (c *Coordinator) AskTask(args *Args, reply *Reply) error {
 
 	if c.index < nTask {
 		*reply = Reply{c.index, taskType, filename, c.nMap, c.nReduce}
-		c.tasks = append(c.tasks, Task{c.index, filename, time.Now().Add(time.Second * 10)})
+		c.tasks = append(c.tasks, Task{c.index, filename, time.Now()})
 		c.index++
 	} else {
 		var flag bool
-		for i := 0; i < len(c.tasks); i++ {
-			if time.Now().After(c.tasks[i].time) {
+		for i := MapTask; i < len(c.tasks); i++ {
+			if time.Since(c.tasks[i].time) > 10*time.Second {
 				*reply = Reply{c.tasks[i].id, taskType, c.tasks[i].filename, c.nMap, c.nReduce}
 				flag = true
 				break
@@ -82,7 +89,7 @@ func (c *Coordinator) AskTask(args *Args, reply *Reply) error {
 		}
 
 		if !flag {
-			reply.TaskType = 2
+			reply.TaskType = Wait
 		}
 	}
 
