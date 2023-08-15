@@ -11,7 +11,6 @@ import (
 )
 
 type Task struct {
-	id       int
 	filename string
 	time     time.Time
 }
@@ -20,7 +19,7 @@ type Coordinator struct {
 	// Your definitions here.
 	files           []string
 	index           int
-	tasks           []Task
+	tasks           map[int]Task
 	nMap            int
 	nReduce         int
 	currentTaskType int
@@ -38,22 +37,16 @@ const (
 func (c *Coordinator) AskTask(args *Args, reply *Reply) error {
 	c.mu.Lock()
 
-	//delete finished task
 	if args.TaskType == c.currentTaskType {
-		for i := 0; i < len(c.tasks); i++ {
-			if args.TaskId == c.tasks[i].id {
-				c.tasks = append(c.tasks[:i], c.tasks[i+1:]...)
-				break
-			}
-		}
+		delete(c.tasks, args.TaskId)
 	}
 
-	if c.currentTaskType == MapTask && c.index == c.nMap && len(c.tasks) == 0 {
+	if len(c.tasks) == 0 && c.currentTaskType == MapTask && c.index == c.nMap {
 		c.currentTaskType = ReduceTask
 		c.index = MapTask
 	}
 
-	if c.currentTaskType == ReduceTask && c.index == c.nReduce && len(c.tasks) == 0 {
+	if len(c.tasks) == 0 && c.currentTaskType == ReduceTask && c.index == c.nReduce {
 		c.currentTaskType = Finished
 	}
 
@@ -63,33 +56,24 @@ func (c *Coordinator) AskTask(args *Args, reply *Reply) error {
 		return nil
 	}
 
-	//allocate task
-	taskType, nTask := ReduceTask, c.nReduce
-	filename := ""
+	filename, nTask := "", c.nReduce
 	if c.currentTaskType == MapTask {
-		taskType = MapTask
-		nTask = c.nMap
-		if c.index < c.nMap {
-			filename = c.files[c.index]
-		}
+		filename, nTask = c.files[c.index%c.nMap], c.nMap
 	}
 
 	if c.index < nTask {
-		*reply = Reply{c.index, taskType, filename, c.nMap, c.nReduce}
-		c.tasks = append(c.tasks, Task{c.index, filename, time.Now()})
+		*reply = Reply{c.index, c.currentTaskType, filename, c.nMap, c.nReduce}
+		c.tasks[c.index] = Task{filename, time.Now()}
 		c.index++
-	} else {
-		var flag bool
-		for i := MapTask; i < len(c.tasks); i++ {
-			if time.Since(c.tasks[i].time) > 10*time.Second {
-				*reply = Reply{c.tasks[i].id, taskType, c.tasks[i].filename, c.nMap, c.nReduce}
-				flag = true
-				break
-			}
-		}
+		c.mu.Unlock()
+		return nil
+	}
 
-		if !flag {
-			reply.TaskType = Wait
+	reply.TaskType = Wait
+	for id, task := range c.tasks {
+		if time.Since(task.time) > 10*time.Second {
+			*reply = Reply{id, c.currentTaskType, task.filename, c.nMap, c.nReduce}
+			break
 		}
 	}
 
@@ -139,7 +123,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	// Your code here.
 	c.files = files
 	c.index = 0
-	c.tasks = make([]Task, 0)
+	c.tasks = map[int]Task{}
 	c.nMap = len(files)
 	c.nReduce = nReduce
 	c.currentTaskType = 0

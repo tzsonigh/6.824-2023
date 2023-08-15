@@ -18,14 +18,6 @@ type KeyValue struct {
 	Value string
 }
 
-// for sorting by key.
-type ByKey []KeyValue
-
-// for sorting by key.
-func (a ByKey) Len() int           { return len(a) }
-func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
-
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
 func ihash(key string) int {
@@ -62,8 +54,6 @@ func Worker(mapf func(string, string) []KeyValue,
 }
 
 func doMapTask(mapf func(string, string) []KeyValue, reply Reply) {
-	intermediate := []KeyValue{}
-
 	file, err := os.Open(reply.Filename)
 	if err != nil {
 		log.Fatalf("reply: %v\ncannot open %v", reply, reply.Filename)
@@ -73,6 +63,8 @@ func doMapTask(mapf func(string, string) []KeyValue, reply Reply) {
 		log.Fatalf("cannot read %v", reply.Filename)
 	}
 	file.Close()
+
+	intermediate := []KeyValue{}
 	kva := mapf(reply.Filename, string(content))
 	intermediate = append(intermediate, kva...)
 
@@ -99,50 +91,45 @@ func doMapTask(mapf func(string, string) []KeyValue, reply Reply) {
 
 func doReduceTask(reducef func(string, []string) string, reply Reply) {
 	intermediate := []KeyValue{}
-
 	for i := 0; i < reply.NMap; i++ {
 		oname := fmt.Sprint("mr-", i, "-", reply.Id)
-		if ofile, err := os.Open(oname); err != nil {
+		ofile, err := os.Open(oname)
+		if err != nil {
 			log.Fatalf("cannot open %v", oname)
-		} else {
-			dec := json.NewDecoder(ofile)
-			for {
-				var kv KeyValue
-				if err := dec.Decode(&kv); err != nil {
-					break
-				}
-				intermediate = append(intermediate, kv)
-			}
-			ofile.Close()
 		}
+
+		dec := json.NewDecoder(ofile)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			intermediate = append(intermediate, kv)
+		}
+		ofile.Close()
 	}
 
-	sort.Sort(ByKey(intermediate))
+	sort.Slice(intermediate, func(i, j int) bool {
+		return intermediate[i].Key < intermediate[j].Key
+	})
 
 	oname := fmt.Sprint("mr-out-", reply.Id)
 	ofile, _ := os.CreateTemp("", oname)
 
-	//
 	// call Reduce on each distinct key in intermediate[],
 	// and print the result to mr-out-0.
-	//
-	i := 0
-	for i < len(intermediate) {
-		j := i + 1
-		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
-			j++
-		}
+	for i, j := 0, 0; i < len(intermediate); i = j {
 		values := []string{}
-		for k := i; k < j; k++ {
-			values = append(values, intermediate[k].Value)
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			values = append(values, intermediate[j].Value)
+			j++
 		}
 		output := reducef(intermediate[i].Key, values)
 
 		// this is the correct format for each line of Reduce output.
 		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
-
-		i = j
 	}
+
 	os.Rename(ofile.Name(), oname)
 	ofile.Close()
 }
