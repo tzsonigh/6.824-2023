@@ -43,7 +43,7 @@ func (c *Coordinator) AskTask(args *Args, reply *Reply) error {
 
 	if len(c.tasks) == 0 && c.currentTaskType == MapTask && c.index == c.nMap {
 		c.currentTaskType = ReduceTask
-		c.index = MapTask
+		c.index = 0
 	}
 
 	if len(c.tasks) == 0 && c.currentTaskType == ReduceTask && c.index == c.nReduce {
