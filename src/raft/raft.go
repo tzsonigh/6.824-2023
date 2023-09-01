@@ -19,12 +19,16 @@ package raft
 
 import (
 	//	"bytes"
+
+	"bytes"
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -109,6 +113,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -129,6 +140,22 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term int
+	var votedFor int
+	var log []LogEntry
+	if d.Decode(&term) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		fmt.Println("failed to decode.")
+	} else {
+		rf.mu.Lock()
+		rf.currentTerm = term
+		rf.votedFor = votedFor
+		rf.log = log
+		rf.mu.Unlock()
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -196,10 +223,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 
+	//DPrintf("leader: %d, log(len): %d", args.LeaderId, len(rf.log))
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+		rf.cond.Broadcast()
 	}
-	rf.cond.Broadcast()
 	reply.Success = true
 }
 
@@ -290,7 +318,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	rf.log = append(rf.log, LogEntry{term, command})
-
+	DPrintf("leader: %d, len(log): %d, last log: %d", rf.me, len(rf.log)-1, rf.log[len(rf.log)-1])
 	return index, term, isLeader
 }
 
@@ -317,6 +345,7 @@ func (rf *Raft) convertToFollower(term int) {
 	rf.currentTerm = term
 	rf.state = Follower
 	rf.votedFor = -1
+	rf.persist()
 }
 
 func (rf *Raft) applyStateMachine() {
@@ -344,29 +373,26 @@ func (rf *Raft) commitChecker() {
 			return
 		}
 
-		N := rf.commitIndex + 1
-		if N >= len(rf.log) {
-			rf.mu.Unlock()
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-		count := 1
-		for i := range rf.peers {
-			if i == rf.me {
-				continue
+		for N := rf.commitIndex + 1; N < len(rf.log); N++ {
+			count := 1
+			for i := range rf.peers {
+				if i == rf.me {
+					continue
+				}
+				if rf.matchIndex[i] >= N {
+					count++
+				}
 			}
-			if rf.matchIndex[i] >= N {
-				count++
+			// if count > len(rf.peers)/2 {
+			// 	DPrintf("N:%d, Term:%d, logTerm:%d", N, rf.currentTerm, rf.log[N].Term)
+			// }
+			if count > len(rf.peers)/2 && rf.log[N].Term == rf.currentTerm {
+				rf.commitIndex = N
+				rf.cond.Broadcast()
 			}
-		}
-
-		if count > len(rf.peers)/2 && rf.log[N].Term == rf.currentTerm {
-			rf.commitIndex = N
-			rf.cond.Broadcast()
 		}
 
 		rf.mu.Unlock()
-
 		time.Sleep(10 * time.Millisecond)
 	}
 }
@@ -392,46 +418,43 @@ func (rf *Raft) appendEntriesChecker() {
 					return
 				}
 
-				if len(rf.log)-1 < rf.nextIndex[server] {
+				if len(rf.log)-1 >= rf.nextIndex[server] {
+					args := &AppendEntriesArgs{
+						Term:         rf.currentTerm,
+						LeaderId:     rf.me,
+						PreLogIndex:  rf.nextIndex[server] - 1,
+						PreLogTerm:   rf.log[rf.nextIndex[server]-1].Term,
+						Entries:      rf.log[rf.nextIndex[server]:],
+						LeaderCommit: rf.commitIndex,
+					}
+					nextIndex := len(rf.log)
 					rf.mu.Unlock()
-					time.Sleep(10 * time.Millisecond)
-					continue
-				}
 
-				args := &AppendEntriesArgs{
-					Term:         rf.currentTerm,
-					LeaderId:     rf.me,
-					PreLogIndex:  rf.nextIndex[server] - 1,
-					PreLogTerm:   rf.log[rf.nextIndex[server]-1].Term,
-					Entries:      rf.log[rf.nextIndex[server]:],
-					LeaderCommit: rf.commitIndex,
+					reply := new(AppendEntriesReply)
+					rf.sendAppendEntries(server, args, reply)
+
+					rf.mu.Lock()
+					if reply.Term > rf.currentTerm {
+						rf.convertToFollower(reply.Term)
+					}
+
+					if args.Term != rf.currentTerm {
+						rf.mu.Unlock()
+						continue
+					}
+
+					if reply.Success {
+						rf.nextIndex[server] = nextIndex
+						rf.matchIndex[server] = nextIndex - 1
+						DPrintf("server:%d matchIndex: %d", server, rf.matchIndex[server])
+					} else {
+						rf.nextIndex[server] = max(1, rf.nextIndex[server]-1)
+						rf.mu.Unlock()
+						continue
+					}
 				}
 				rf.mu.Unlock()
 
-				reply := new(AppendEntriesReply)
-				rf.sendAppendEntries(server, args, reply)
-
-				rf.mu.Lock()
-				if reply.Term > rf.currentTerm {
-					rf.convertToFollower(reply.Term)
-				}
-
-				if args.Term != rf.currentTerm {
-					rf.mu.Unlock()
-					time.Sleep(10 * time.Millisecond)
-					continue
-				}
-
-				if reply.Success {
-					rf.nextIndex[server] = len(rf.log)
-					rf.matchIndex[server] = max(rf.matchIndex[server], rf.nextIndex[server]-1)
-				} else {
-					rf.nextIndex[server] = max(1, rf.nextIndex[server]-1)
-					rf.mu.Unlock()
-					continue
-				}
-
-				rf.mu.Unlock()
 				time.Sleep(10 * time.Millisecond)
 			}
 		}(i)
@@ -572,9 +595,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	rf.log[0] = LogEntry{0, 0}
-	for i := range rf.peers {
-		rf.nextIndex[i], rf.matchIndex[i] = 1, 0
-	}
+	// for i := range rf.peers {
+	// 	rf.nextIndex[i], rf.matchIndex[i] = 1, 0
+	// }
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.applyStateMachine()
