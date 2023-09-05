@@ -179,6 +179,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	XTerm   int
+	XIndex  int
+	XLen    int
 }
 
 // example RequestVote RPC arguments structure.
@@ -209,24 +212,43 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	rf.convertToFollower(args.Term)
+	if args.Term > rf.currentTerm {
+		rf.convertToFollower(args.Term)
+	}
 	rf.timestamp = time.Now()
 
-	if len(rf.log) <= args.PreLogIndex || rf.log[args.PreLogIndex].Term != args.PreLogTerm {
+	if len(rf.log) <= args.PreLogIndex {
+		reply.XLen = len(rf.log)
+		return
+	}
+
+	if rf.log[args.PreLogIndex].Term != args.PreLogTerm {
+		reply.XTerm = rf.log[args.PreLogIndex].Term
+		for i := args.PreLogIndex; i >= 0; i-- {
+			if rf.log[i].Term != reply.Term {
+				break
+			}
+			reply.XIndex = i
+		}
 		return
 	}
 
 	for i, j := 0, args.PreLogIndex+1; i < len(args.Entries); i, j = i+1, j+1 {
 		if j == len(rf.log) || args.Entries[i].Term != rf.log[j].Term {
 			rf.log = append(rf.log[:j], args.Entries[i:]...)
+			rf.persist()
 			break
 		}
 	}
 
 	//DPrintf("leader: %d, log(len): %d", args.LeaderId, len(rf.log))
 	if args.LeaderCommit > rf.commitIndex {
+		commitIndex := rf.commitIndex
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
-		rf.cond.Broadcast()
+		if rf.commitIndex > commitIndex {
+			rf.cond.Broadcast()
+		}
+
 	}
 	reply.Success = true
 }
@@ -257,6 +279,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		rf.votedFor = args.CandidateId
+		rf.persist()
 		rf.timestamp = time.Now()
 		reply.VoteGranted = true
 	}
@@ -318,7 +341,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	rf.log = append(rf.log, LogEntry{term, command})
-	DPrintf("leader: %d, len(log): %d, last log: %d", rf.me, len(rf.log)-1, rf.log[len(rf.log)-1])
+	rf.persist()
+	//DPrintf("leader: %d, len(log): %d, last log: %d", rf.me, len(rf.log)-1, rf.log[len(rf.log)-1])
 	return index, term, isLeader
 }
 
@@ -348,7 +372,7 @@ func (rf *Raft) convertToFollower(term int) {
 	rf.persist()
 }
 
-func (rf *Raft) applyStateMachine() {
+func (rf *Raft) applier() {
 	for {
 		rf.mu.Lock()
 		for rf.lastApplied >= rf.commitIndex {
@@ -373,7 +397,10 @@ func (rf *Raft) commitChecker() {
 			return
 		}
 
-		for N := rf.commitIndex + 1; N < len(rf.log); N++ {
+		for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
+			if rf.log[N].Term != rf.currentTerm {
+				break
+			}
 			count := 1
 			for i := range rf.peers {
 				if i == rf.me {
@@ -386,9 +413,10 @@ func (rf *Raft) commitChecker() {
 			// if count > len(rf.peers)/2 {
 			// 	DPrintf("N:%d, Term:%d, logTerm:%d", N, rf.currentTerm, rf.log[N].Term)
 			// }
-			if count > len(rf.peers)/2 && rf.log[N].Term == rf.currentTerm {
+			if count > len(rf.peers)/2 {
 				rf.commitIndex = N
 				rf.cond.Broadcast()
+				break
 			}
 		}
 
@@ -418,44 +446,57 @@ func (rf *Raft) appendEntriesChecker() {
 					return
 				}
 
-				if len(rf.log)-1 >= rf.nextIndex[server] {
-					args := &AppendEntriesArgs{
-						Term:         rf.currentTerm,
-						LeaderId:     rf.me,
-						PreLogIndex:  rf.nextIndex[server] - 1,
-						PreLogTerm:   rf.log[rf.nextIndex[server]-1].Term,
-						Entries:      rf.log[rf.nextIndex[server]:],
-						LeaderCommit: rf.commitIndex,
-					}
-					nextIndex := len(rf.log)
+				if len(rf.log)-1 < rf.nextIndex[server] {
 					rf.mu.Unlock()
-
-					reply := new(AppendEntriesReply)
-					rf.sendAppendEntries(server, args, reply)
-
-					rf.mu.Lock()
-					if reply.Term > rf.currentTerm {
-						rf.convertToFollower(reply.Term)
-					}
-
-					if args.Term != rf.currentTerm {
-						rf.mu.Unlock()
-						continue
-					}
-
-					if reply.Success {
-						rf.nextIndex[server] = nextIndex
-						rf.matchIndex[server] = nextIndex - 1
-						DPrintf("server:%d matchIndex: %d", server, rf.matchIndex[server])
-					} else {
-						rf.nextIndex[server] = max(1, rf.nextIndex[server]-1)
-						rf.mu.Unlock()
-						continue
-					}
+					time.Sleep(10 * time.Millisecond)
+					continue
 				}
+
+				args := &AppendEntriesArgs{
+					Term:         rf.currentTerm,
+					LeaderId:     rf.me,
+					PreLogIndex:  rf.nextIndex[server] - 1,
+					PreLogTerm:   rf.log[rf.nextIndex[server]-1].Term,
+					Entries:      rf.log[rf.nextIndex[server]:],
+					LeaderCommit: rf.commitIndex,
+				}
+				//nextIndex := len(rf.log)
 				rf.mu.Unlock()
 
-				time.Sleep(10 * time.Millisecond)
+				reply := new(AppendEntriesReply)
+				rf.sendAppendEntries(server, args, reply)
+
+				rf.mu.Lock()
+				if reply.Term > rf.currentTerm {
+					rf.convertToFollower(reply.Term)
+				}
+
+				if args.Term != rf.currentTerm {
+					rf.mu.Unlock()
+					continue
+				}
+
+				if reply.Success {
+					rf.nextIndex[server] = args.PreLogIndex + len(args.Entries) + 1
+					rf.matchIndex[server] = args.PreLogIndex + len(args.Entries)
+					//	DPrintf("server:%d matchIndex: %d", server, rf.matchIndex[server])
+					rf.mu.Unlock()
+					time.Sleep(10 * time.Millisecond)
+					continue
+				}
+
+				if reply.XLen != 0 {
+					rf.nextIndex[server] = reply.XLen
+				} else {
+					rf.nextIndex[server] = reply.XIndex
+					for i := range rf.log {
+						if rf.log[i].Term == reply.XTerm {
+							rf.nextIndex[server] = i
+						}
+					}
+				}
+				rf.nextIndex[server] = max(1, rf.nextIndex[server])
+				rf.mu.Unlock()
 			}
 		}(i)
 	}
@@ -502,6 +543,7 @@ func (rf *Raft) startElection() {
 	rf.state = Candidate
 	rf.currentTerm++
 	rf.votedFor = rf.me
+	rf.persist()
 	rf.timestamp = time.Now()
 	args := &RequestVoteArgs{
 		Term:         rf.currentTerm,
@@ -593,14 +635,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
+	for i := range rf.peers {
+		rf.nextIndex[i], rf.matchIndex[i] = len(rf.log), 0
+	}
 	rf.log[0] = LogEntry{0, 0}
-	// for i := range rf.peers {
-	// 	rf.nextIndex[i], rf.matchIndex[i] = 1, 0
-	// }
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	go rf.applyStateMachine()
+	go rf.applier()
 	return rf
 }
 
